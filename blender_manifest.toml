@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+id = "blendlocation"
+version = "0.1.0"
+name = "BlendLocation"
+tagline = "Import real elevation terrain into a local Blender site"
+maintainer = "Coasterpete"
+type = "add-on"
+website = "https://github.com/Coasterpete/BlendLocation"
+blender_version_min = "5.2.0"
+license = ["SPDX:GPL-3.0-only"]
+
+[permissions]
+network = "Download public terrain tiles from Mapzen Terrain Tiles on AWS"
+files = "Cache downloaded terrain tiles in the user cache directory"
+
+[build]
+paths = ["__init__.py", "geo.py", "terrarium.py", "providers.py", "terrain.py", "operators.py", "ui.py", "fixtures/hill.png"]
