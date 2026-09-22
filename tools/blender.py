@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--blender", help="Path to Blender 5.2 executable")
     args = parser.parse_args()
     blender = find_blender(args.blender)
-    output = ROOT / "dist" / "blendlocation-0.1.0.zip"
+    output = ROOT / "dist" / "blendlocation-0.2.0.zip"
     output.parent.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="blendlocation-test-") as tmp:
         env = os.environ.copy()

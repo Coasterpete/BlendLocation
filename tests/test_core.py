@@ -3,6 +3,7 @@ import importlib
 from pathlib import Path
 import struct
 import sys
+import tempfile
 import types
 import unittest
 import zlib
@@ -16,6 +17,8 @@ geo = importlib.import_module(f"{PACKAGE}.geo")
 terrain = importlib.import_module(f"{PACKAGE}.terrain")
 terrarium = importlib.import_module(f"{PACKAGE}.terrarium")
 providers = importlib.import_module(f"{PACKAGE}.providers")
+map_math = importlib.import_module(f"{PACKAGE}.map_math")
+map_imagery = importlib.import_module(f"{PACKAGE}.map_imagery")
 
 
 class GeographicTests(unittest.TestCase):
@@ -96,6 +99,116 @@ class TerrainTests(unittest.TestCase):
             zoom, (x0, x1, y0, y1) = provider._choose_zoom(geo.Area(40, -74, width, width))
             self.assertLessEqual((x1 - x0 + 1) * (y1 - y0 + 1), providers.MAX_PIXELS)
             self.assertLessEqual((x1 // 256 - x0 // 256 + 1) * (y1 // 256 - y0 // 256 + 1), providers.MAX_TILES)
+
+
+class PickerTests(unittest.TestCase):
+    def test_drag_move_resize_and_terrain_alignment(self):
+        original = geo.Area(40.7, -74, 1000, 800)
+        view = map_math.MapView(original.latitude, original.longitude, 14, 768, 512)
+        rect = map_math.area_rect(view, original)
+        dragged = map_math.area_from_drag(view, rect[0], rect[1], rect[2], rect[3])
+        self.assertAlmostEqual(dragged.latitude, original.latitude, places=5)
+        self.assertAlmostEqual(dragged.longitude, original.longitude, places=5)
+        self.assertAlmostEqual(dragged.width_m, original.width_m, delta=.2)
+        self.assertAlmostEqual(dragged.height_m, original.height_m, delta=.2)
+        moved = map_math.moved_area(view, dragged, 30, -20)
+        self.assertAlmostEqual(moved.width_m, dragged.width_m)
+        resized = map_math.area_from_drag(view, rect[0], rect[1], rect[2] + 40, rect[3] + 25)
+        self.assertGreater(resized.width_m, original.width_m)
+        self.assertGreater(resized.height_m, original.height_m)
+        grid = providers.FixtureProvider().fetch(resized)
+        vertices, _ = terrain.mesh_data(grid, resized)
+        self.assertAlmostEqual(vertices[0][0], -resized.width_m / 2, places=5)
+        self.assertAlmostEqual(vertices[0][1], resized.height_m / 2, places=5)
+        self.assertAlmostEqual(vertices[-1][0], resized.width_m / 2, places=5)
+        self.assertAlmostEqual(vertices[-1][1], -resized.height_m / 2, places=5)
+
+    def test_view_zoom_anchor_and_visible_tiles(self):
+        view = map_math.MapView(40.7, -74, 11, 768, 512)
+        anchor = view.screen_to_geo(220, 180)
+        view.zoom_at(1, 220, 180)
+        actual = view.screen_to_geo(220, 180)
+        self.assertAlmostEqual(actual[0], anchor[0], places=8)
+        self.assertAlmostEqual(actual[1], anchor[1], places=8)
+        self.assertLessEqual(len(view.tiles()), 20)
+
+    def test_corner_resize_keeps_opposite_corner(self):
+        area = geo.Area(40.7, -74, 1000, 800)
+        view = map_math.MapView(area.latitude, area.longitude, 15, 768, 512)
+        left, bottom, right, top = map_math.area_rect(view, area)
+        for handle, start, delta, fixed in (
+            ("NW", (left, top), (-30, 20), (right, bottom)),
+            ("NE", (right, top), (30, 20), (left, bottom)),
+            ("SW", (left, bottom), (-30, -20), (right, top)),
+            ("SE", (right, bottom), (30, -20), (left, top)),
+        ):
+            resized = map_math.resized_area(view, area, handle, start[0] + delta[0], start[1] + delta[1])
+            self.assertGreater(resized.width_m, area.width_m)
+            self.assertGreater(resized.height_m, area.height_m)
+            bounds = map_math.area_rect(view, resized)
+            actual = (bounds[2] if handle.endswith("W") else bounds[0],
+                      bounds[3] if handle.startswith("S") else bounds[1])
+            self.assertAlmostEqual(actual[0], fixed[0], delta=.1)
+            self.assertAlmostEqual(actual[1], fixed[1], delta=.1)
+
+    def test_offline_map_tile_cache_and_failure(self):
+        data = (Path(__file__).parent / "fixtures" / "map_tile.png").read_bytes()
+
+        class Response:
+            headers = {"Cache-Control": "max-age=604800", "ETag": '"fixture"'}
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, size): return data
+
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            return Response()
+
+        with tempfile.TemporaryDirectory() as root:
+            source = map_imagery.OpenStreetMapProvider(root, opener)
+            path = source._tile(11, 600, 700)
+            self.assertEqual(path.read_bytes(), data)
+            self.assertEqual(source._tile(11, 600, 700), path)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("BlendLocation", calls[0].get_header("User-agent"))
+            self.assertTrue((path.with_suffix(".json")).is_file())
+            failed = map_imagery.OpenStreetMapProvider(Path(root) / "fail", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("offline")))
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                failed._tile(11, 600, 700)
+
+    def test_aerial_unavailable_and_export(self):
+        view = map_math.MapView(40.7, -74, 12, 512, 384)
+        png = (Path(__file__).parent / "fixtures" / "map_tile.png").read_bytes()
+
+        class Response:
+            headers = {}
+            def __init__(self, data): self.data = data
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, size): return self.data
+
+        urls = []
+        def unavailable(request, timeout):
+            urls.append(request.full_url)
+            return Response(b'{"count":0}')
+
+        with tempfile.TemporaryDirectory() as root:
+            provider = map_imagery.USGSNAIPProvider(root, unavailable)
+            with self.assertRaises(map_imagery.ImageryUnavailable):
+                list(provider.fetch(view))
+            self.assertEqual(len(urls), 1)
+            def available(request, timeout):
+                urls.append(request.full_url)
+                return Response(b'{"count":1}' if "/query?" in request.full_url else png)
+            provider = map_imagery.USGSNAIPProvider(root, available)
+            result = list(provider.fetch(view))
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0][1].read_bytes(), png)
+            self.assertIn("renderingRule=", urls[-1])
+            request_count = len(urls)
+            self.assertEqual(list(provider.fetch(view)), result)
+            self.assertEqual(len(urls), request_count, "A valid cached aerial view should make no request")
 
 
 if __name__ == "__main__":
